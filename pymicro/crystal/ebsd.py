@@ -260,10 +260,10 @@ class OimScan:
             for i in range(n_phases):
                 # read this phase (lengths, angles, name, ?, space group, description)
                 line = f.readline().strip()
-                tokens = line.split()
+                tokens = line.split("\t")
+                print(tokens)
                 phase = CrystallinePhase(i + 1)
                 phase.name = tokens[2]
-                phase.name = tokens[5]
 
                 sym = Symmetry.from_space_group(int(tokens[4]))
                 lattice_lengths = tokens[0].split(';')
@@ -286,7 +286,7 @@ class OimScan:
             data = np.zeros((scan.cols * scan.rows, len(line.split())))
             i = 0
             for line in f:
-                data[i] = np.fromstring(line, sep=' ')
+                data[i] = np.fromstring(line, sep='\t')
                 i += 1
             # we have read all the data, now repack everything into the different arrays
             scan.init_arrays()
@@ -297,7 +297,7 @@ class OimScan:
             scan.y = np.reshape(data[:, 2], (scan.rows, scan.cols)).T
             scan.iq = np.reshape(data[:, 9], (scan.rows, scan.cols)).T
             scan.ci = np.reshape(data[:, 10], (scan.rows, scan.cols)).T
-            scan.phase = np.reshape(data[:, 0], (scan.rows, scan.cols)).T
+            scan.phase = np.reshape(data[:, 0], (scan.rows, scan.cols)).T.astype('int')
         return scan
 
     def read_header(self, header):
@@ -384,6 +384,60 @@ class OimScan:
                                     (scan.rows, scan.cols)).transpose(1, 0)
         return scan
 
+    @classmethod
+    def read_mtex(cls, file_path):
+        """Read a scan from MTEX"""
+        scan = OimScan((0, 0))
+        with h5py.File(file_path, 'r') as f:
+            # labDCT data is in X, Y, Z dimension order
+            # this is how data should be stored for EBSD too
+            # first axis (rows) is x, which is vertical in the array printouts
+            # second axis (columns) is y, which is horizontal in the array printouts
+
+            # get the size of the map
+            scan.xSize = int(f["xSize"][0])
+            scan.ySize = int(f["ySize"][0])
+
+            # initialise map memory
+            scan.euler = np.zeros((scan.xSize, scan.ySize, 3))
+            scan.x =     np.zeros((scan.xSize, scan.ySize))
+            scan.y =     np.zeros((scan.xSize, scan.ySize))
+            scan.iq =    np.zeros((scan.xSize, scan.ySize))
+            scan.ci =    np.zeros((scan.xSize, scan.ySize))
+            scan.phase = np.zeros((scan.xSize, scan.ySize), dtype='int')
+
+            # import map arrays
+            scan.euler[:, :, 0] = f["phi1"][()]
+            scan.euler[:, :, 1] = f["Phi"][()]
+            scan.euler[:, :, 2] = f["phi2"][()]
+            scan.x = f["x"][()]
+            scan.y = f["y"][()]
+            scan.bc = f["bc"][()]
+            scan.bs = f["bs"][()]
+            scan.mad = f["mad"][()]
+            scan.quality = f["quality"][()]
+            scan.phase = f["phase_map"][()].astype(int)
+
+            scan.xStep = f["step_size"][0][0] / 1000
+            scan.yStep = f["step_size"][0][0] / 1000
+
+            for phase_key in f["phases"].keys():
+                phase = CrystallinePhase(int(phase_key))
+                phase.name = f["phases"][phase_key].attrs["name"]
+                a = f["phases"][phase_key]["a"][0][0] / 10
+                b = f["phases"][phase_key]["b"][0][0] / 10
+                c = f["phases"][phase_key]["c"][0][0] / 10
+                alpha = np.degrees(f["phases"][phase_key]["alpha"][0][0])
+                beta = np.degrees(f["phases"][phase_key]["beta"][0][0])
+                gamma = np.degrees(f["phases"][phase_key]["gamma"][0][0])
+
+                symmetry = Lattice.guess_symmetry_from_parameters(a, b, c, alpha, beta, gamma)
+                lattice = Lattice.from_parameters(a, b, c, alpha, beta, gamma, symmetry=symmetry)
+                phase.set_lattice(lattice)
+                scan.phase_list.append(phase)
+
+        return scan
+
     def get_phase(self, phase_id=1):
         """Look for a phase with the given id in the list.
 
@@ -465,9 +519,14 @@ class OimScan:
         grain_ids += -1  # mark all pixels as non assigned
         # start by assigning bad pixel to grain 0
         grain_ids[self.ci <= min_ci] = 0
+        # get bad pixels also by phase ID
+        grain_ids[self.phase == 0] = 0
 
         n_grains = 0
         progress = 0
+
+        # print("Phase is")
+        # print(self.phase)
         for j in range(self.rows):
             for i in range(self.cols):
                 if grain_ids[i, j] >= 0:
@@ -480,7 +539,13 @@ class OimScan:
                 # apply region growing based on the angle misorientation (strong connectivity)
                 while len(candidates) > 0:
                     pixel = candidates.pop()
-                    sym = self.phase_list[self.phase[pixel]].get_symmetry()
+                    # print("Pixel is")
+                    # print(pixel)
+                    # print("self.phase[pixel] is")
+                    # print(self.phase[pixel])
+                    # print("self.phase_list is")
+                    # print(self.phase_list)
+                    sym = self.phase_list[self.phase[pixel]-1].get_symmetry()
                     # print('* pixel is {}, euler: {}'.format(pixel, np.degrees(euler[pixel])))
                     # get orientation of this pixel
                     o = Orientation.from_euler(np.degrees(self.euler[pixel]))
@@ -497,14 +562,16 @@ class OimScan:
                                      grain_ids[n] == -1]
                     # print(' * neighbors list is {}'.format([east, north, west, south]))
                     for neighbor in neighbor_list:
-                        # check misorientation
-                        o_neighbor = Orientation.from_euler(np.degrees(self.euler[neighbor]))
-                        mis, _, _ = o.disorientation(o_neighbor, crystal_structure=sym)
-                        if mis * 180 / np.pi < tol:
-                            # add to this grain
-                            grain_ids[neighbor] = n_grains
-                            # add to the list of candidates
-                            candidates.append(neighbor)
+                        if self.phase[neighbor] == self.phase[pixel]:
+                            # check misorientation
+                            o_neighbor = Orientation.from_euler(np.degrees(self.euler[neighbor]))
+                            mis, _, _ = o.disorientation(o_neighbor, crystal_structure=sym)
+                            if mis * 180 / np.pi < tol:
+                                print(f"Found neighbor for pixel: {pixel}:{self.phase[pixel]}:{self.euler[pixel]} and {neighbor}{self.phase[pixel]}:{self.euler[neighbor]}")
+                                # add to this grain
+                                grain_ids[neighbor] = n_grains
+                                # add to the list of candidates
+                                candidates.append(neighbor)
                     progress = 100 * np.sum(grain_ids >= 0) / (self.cols * self.rows)
             print('segmentation progress: {0:.2f} %'.format(progress), end='\r')
         print('\n%d grains were segmented' % len(np.unique(grain_ids)))
@@ -527,10 +594,12 @@ class OimScan:
                       [0., 0., -1.]])  # Z is -A3
         for j in range(self.rows):
             for i in range(self.cols):
-                o_tsl = Orientation.from_euler(np.degrees(self.euler[i, j, :]))
-                g_xyz = np.dot(o_tsl.orientation_matrix(), T.T)  # move to XYZ local frame
-                o_xyz = Orientation(g_xyz)
-                self.euler[i, j, :] = np.radians(o_xyz.euler)
+                o_tsl = self.euler[i, j, :]
+                g_tsl = Orientation.Euler2OrientationMatrix(o_tsl)
+                g_xyz = np.dot(g_tsl, T.T)  # move to XYZ local frame
+                o_xyz = Orientation.OrientationMatrix2Euler(g_xyz)
+
+                self.euler[i, j, :] = o_xyz
                 progress = 100 * (j * self.cols + i) / (self.cols * self.rows)
             print('changing orientation reference frame progress: {0:.2f} %'.format(progress), end='\r')
         print('\n')
